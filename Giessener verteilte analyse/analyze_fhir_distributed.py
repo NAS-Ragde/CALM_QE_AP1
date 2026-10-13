@@ -165,8 +165,21 @@ def main():
     else:
         observation['patient_id'] = np.nan
 
-    if "(1.2) code.coding.code" in observation.columns:
-        observation['loinc_code'] = observation['(1.2) code.coding.code'].astype(str)
+    # Observations can carry multiple codings and sites order them differently
+    # (e.g. local code first, LOINC second - or vice versa). Prefer whichever
+    # slot contains a code from the configured analyte groups.
+    obs_code_cols = [c for c in observation.columns if c.endswith(') code.coding.code')]
+    known_codes = set(eosinophil_loincs) | set(ige_loincs) | set(weight_loincs)
+    if obs_code_cols:
+        loinc_code = pd.Series(np.nan, index=observation.index, dtype=object)
+        for c in obs_code_cols:
+            vals = observation[c].astype(str)
+            take = vals.isin(known_codes) & ~loinc_code.isin(known_codes)
+            loinc_code[take] = vals[take]
+        fallback = None
+        for c in obs_code_cols:
+            fallback = observation[c] if fallback is None else fallback.fillna(observation[c])
+        observation['loinc_code'] = loinc_code.fillna(fallback.astype(str))
     else:
         observation['loinc_code'] = np.nan
 
@@ -206,7 +219,26 @@ def main():
         diag_ref_cols = [c for c in encounter.columns if c.endswith('diagnosis.condition.reference')]
         
         if len(diag_ref_cols) == 0:
-            logging.warning("  WARNING: Encounter contains no diagnosis columns. Falling back to all diagnoses.")
+            # Some sites (e.g. UK Essen/SHIP) do not populate Encounter.diagnosis.
+            # There the primary diagnosis is marked on the Condition itself via
+            # category (e.g. "DRG-Hauptdiagnose", "Hauptdiagnose/therapie ...").
+            logging.warning("  WARNING: Encounter contains no diagnosis columns. Falling back to Condition.category 'Hauptdiagnose'.")
+            cat_cols = [c for c in condition.columns if c.endswith('category.coding.display')]
+            if cat_cols and '(1) encounter.reference' in condition.columns and '(1) id' in condition.columns:
+                is_haupt = pd.Series(False, index=condition.index)
+                for c in cat_cols:
+                    is_haupt |= condition[c].astype(str).str.contains('Hauptdiagnose', case=False, na=False)
+                haupt = condition[is_haupt]
+                if not haupt.empty:
+                    encounter_diag = pd.DataFrame({
+                        'encounter_id': haupt['(1) encounter.reference'].astype(str).str.replace('Encounter/', ''),
+                        'patient_id': haupt['(1) subject.reference'].astype(str).str.replace('Patient/', ''),
+                        'condition_ref': haupt['(1) id'].astype(str),
+                        'rank_value': 1.0,
+                    })
+                    encounter_diag = encounter_diag[encounter_diag['encounter_id'] != 'nan'].copy()
+                    encounter_diag['condition_id'] = encounter_diag['condition_ref']
+                    logging.info(f"  -> Fallback found {len(encounter_diag)} Hauptdiagnose entries via Condition.category.")
         else:
             slot_dfs = []
             for ref_col in diag_ref_cols:
@@ -341,8 +373,16 @@ def main():
         "pearson_r": pearson_r,
         "p_value": p_value,
         "mean_eos_all": round(float(copd_corr['mean_eos'].mean()), 4) if not copd_corr.empty else None,
+        "std_eos_all": round(float(copd_corr['mean_eos'].std()), 4) if len(copd_corr) > 1 else None,
+        "median_eos_all": round(float(copd_corr['mean_eos'].median()), 4) if not copd_corr.empty else None,
+        "q25_eos_all": round(float(copd_corr['mean_eos'].quantile(0.25)), 4) if not copd_corr.empty else None,
+        "q75_eos_all": round(float(copd_corr['mean_eos'].quantile(0.75)), 4) if not copd_corr.empty else None,
         "unit_eos": str(unit_eos),
-        "mean_exacerbations_all": round(float(copd_corr['num_exacerbations'].mean()), 4) if not copd_corr.empty else None
+        "mean_exacerbations_all": round(float(copd_corr['num_exacerbations'].mean()), 4) if not copd_corr.empty else None,
+        "std_exacerbations_all": round(float(copd_corr['num_exacerbations'].std()), 4) if len(copd_corr) > 1 else None,
+        "median_exacerbations_all": round(float(copd_corr['num_exacerbations'].median()), 4) if not copd_corr.empty else None,
+        "q25_exacerbations_all": round(float(copd_corr['num_exacerbations'].quantile(0.25)), 4) if not copd_corr.empty else None,
+        "q75_exacerbations_all": round(float(copd_corr['num_exacerbations'].quantile(0.75)), 4) if not copd_corr.empty else None
     }
 
     # --- ANALYSIS 2: Inhaled Medications ---
@@ -390,8 +430,9 @@ def main():
             "diagnosis": diag,
             "n_measurements": len(subset),
             "n_patients": obs[obs['patient_id'].isin(pts['patient_id'])]['patient_id'].nunique(),
-            "median_ige": round(float(subset.median()), 2),
             "mean_ige": round(float(subset.mean()), 2),
+            "std_ige": round(float(subset.std()), 2) if len(subset) > 1 else None,
+            "median_ige": round(float(subset.median()), 2),
             "q25": round(float(subset.quantile(0.25)), 2),
             "q75": round(float(subset.quantile(0.75)), 2),
             "min_ige": round(float(subset.min()), 2),
@@ -431,7 +472,15 @@ def main():
             "pearson_r": round(r, 4) if r is not None else None,
             "p_value": round(p, 6) if p is not None else None,
             "mean_eos_all": round(float(df['mean_eos'].mean()), 4) if not df.empty else None,
+            "std_eos_all": round(float(df['mean_eos'].std()), 4) if len(df) > 1 else None,
+            "median_eos_all": round(float(df['mean_eos'].median()), 4) if not df.empty else None,
+            "q25_eos_all": round(float(df['mean_eos'].quantile(0.25)), 4) if not df.empty else None,
+            "q75_eos_all": round(float(df['mean_eos'].quantile(0.75)), 4) if not df.empty else None,
             "mean_weight_all": round(float(df['mean_weight'].mean()), 4) if not df.empty else None,
+            "std_weight_all": round(float(df['mean_weight'].std()), 4) if len(df) > 1 else None,
+            "median_weight_all": round(float(df['mean_weight'].median()), 4) if not df.empty else None,
+            "q25_weight_all": round(float(df['mean_weight'].quantile(0.25)), 4) if not df.empty else None,
+            "q75_weight_all": round(float(df['mean_weight'].quantile(0.75)), 4) if not df.empty else None,
             "unit_eos": str(unit_eos),
             "unit_weight": str(unit_weight)
         }
@@ -583,6 +632,30 @@ def main():
             else:
                 return f"Erhöht (>{eos_threshold})"
 
+        def compute_descriptive_stats(vals):
+            vals = vals.dropna()
+            if vals.empty:
+                return {
+                    "count": 0,
+                    "mean": None,
+                    "std": None,
+                    "median": None,
+                    "q25": None,
+                    "q75": None,
+                    "min": None,
+                    "max": None
+                }
+            return {
+                "count": int(len(vals)),
+                "mean": round(float(vals.mean()), 4),
+                "std": round(float(vals.std()), 4) if len(vals) > 1 else None,
+                "median": round(float(vals.median()), 4),
+                "q25": round(float(vals.quantile(0.25)), 4),
+                "q75": round(float(vals.quantile(0.75)), 4),
+                "min": round(float(vals.min()), 4),
+                "max": round(float(vals.max()), 4)
+            }
+
         subcats = ["COPD J44.0 (Infekt)", "COPD J44.1 (Exazerbation)", "COPD J44.8/9 (Sonstige/Unspez.)", "Asthma-exklusiv", "Overlap"]
         eos_cats = ["Ohne Messung", f"Normal (<={eos_threshold})", f"Erhöht (>{eos_threshold})"]
 
@@ -600,25 +673,11 @@ def main():
 
         stats_3g_erst = {}
         for g, sub in df_dedup_erst[df_dedup_erst['Three_Group_Category'] != 'Andere'].groupby('Three_Group_Category'):
-            vals = sub['max_eo'].dropna()
-            stats_3g_erst[g] = {
-                "count": int(len(vals)),
-                "mean": round(float(vals.mean()), 4) if not vals.empty else None,
-                "median": round(float(vals.median()), 4) if not vals.empty else None,
-                "min": round(float(vals.min()), 4) if not vals.empty else None,
-                "max": round(float(vals.max()), 4) if not vals.empty else None
-            }
+            stats_3g_erst[g] = compute_descriptive_stats(sub['max_eo'])
 
         stats_sub_erst = {}
         for g, sub in df_dedup_erst[~df_dedup_erst['Subcategory'].isin(['COPD Sonstige', 'Andere'])].groupby('Subcategory'):
-            vals = sub['max_eo'].dropna()
-            stats_sub_erst[g] = {
-                "count": int(len(vals)),
-                "mean": round(float(vals.mean()), 4) if not vals.empty else None,
-                "median": round(float(vals.median()), 4) if not vals.empty else None,
-                "min": round(float(vals.min()), 4) if not vals.empty else None,
-                "max": round(float(vals.max()), 4) if not vals.empty else None
-            }
+            stats_sub_erst[g] = compute_descriptive_stats(sub['max_eo'])
 
         df_dedup_erst['Eos_Category'] = df_dedup_erst['max_eo'].apply(categorize_eos)
         df_sun_erst = df_dedup_erst[df_dedup_erst['Subcategory'].isin(subcats)].copy()
@@ -677,25 +736,11 @@ def main():
         
         stats_3g = {}
         for g, sub in df_dedup_3[df_dedup_3['Three_Group_Category'] != 'Andere'].groupby('Three_Group_Category'):
-            vals = sub['max_eo'].dropna()
-            stats_3g[g] = {
-                "count": int(len(vals)),
-                "mean": round(float(vals.mean()), 4) if not vals.empty else None,
-                "median": round(float(vals.median()), 4) if not vals.empty else None,
-                "min": round(float(vals.min()), 4) if not vals.empty else None,
-                "max": round(float(vals.max()), 4) if not vals.empty else None
-            }
+            stats_3g[g] = compute_descriptive_stats(sub['max_eo'])
         
         stats_sub = {}
         for g, sub in df_dedup_3[~df_dedup_3['Subcategory'].isin(['COPD Sonstige', 'Andere'])].groupby('Subcategory'):
-            vals = sub['max_eo'].dropna()
-            stats_sub[g] = {
-                "count": int(len(vals)),
-                "mean": round(float(vals.mean()), 4) if not vals.empty else None,
-                "median": round(float(vals.median()), 4) if not vals.empty else None,
-                "min": round(float(vals.min()), 4) if not vals.empty else None,
-                "max": round(float(vals.max()), 4) if not vals.empty else None
-            }
+            stats_sub[g] = compute_descriptive_stats(sub['max_eo'])
             
         df_dedup_3['Eos_Category'] = df_dedup_3['max_eo'].apply(categorize_eos)
         df_sun = df_dedup_3[df_dedup_3['Subcategory'].isin(subcats)].copy()
@@ -792,16 +837,20 @@ def main():
             cons_pct_90 = (cons_count_90 / total_pat_with_eos * 100) if total_pat_with_eos > 0 else 0.0
             cons_subset_90 = patient_stats[patient_stats['Consistently_Elevated_90'] == "Durchgängig erhöht (>=90%)"]
             non_subset_90 = patient_stats[patient_stats['Consistently_Elevated_90'] == "Nicht durchgängig erhöht (<90%)"]
-            median_tests_cons_90 = float(cons_subset_90['Total_Measurements'].median()) if not cons_subset_90.empty else 0.0
-            median_tests_non_90 = float(non_subset_90['Total_Measurements'].median()) if not non_subset_90.empty else 0.0
+            stats_tests_cons_90 = compute_descriptive_stats(cons_subset_90['Total_Measurements'])
+            stats_tests_non_90 = compute_descriptive_stats(non_subset_90['Total_Measurements'])
+            median_tests_cons_90 = float(stats_tests_cons_90['median']) if stats_tests_cons_90['median'] is not None else 0.0
+            median_tests_non_90 = float(stats_tests_non_90['median']) if stats_tests_non_90['median'] is not None else 0.0
 
             # 50% stats
             cons_count_50 = int(sum(patient_stats['Consistently_Elevated_50'] == "Durchgängig erhöht (>=50%)"))
             cons_pct_50 = (cons_count_50 / total_pat_with_eos * 100) if total_pat_with_eos > 0 else 0.0
             cons_subset_50 = patient_stats[patient_stats['Consistently_Elevated_50'] == "Durchgängig erhöht (>=50%)"]
             non_subset_50 = patient_stats[patient_stats['Consistently_Elevated_50'] == "Nicht durchgängig erhöht (<50%)"]
-            median_tests_cons_50 = float(cons_subset_50['Total_Measurements'].median()) if not cons_subset_50.empty else 0.0
-            median_tests_non_50 = float(non_subset_50['Total_Measurements'].median()) if not non_subset_50.empty else 0.0
+            stats_tests_cons_50 = compute_descriptive_stats(cons_subset_50['Total_Measurements'])
+            stats_tests_non_50 = compute_descriptive_stats(non_subset_50['Total_Measurements'])
+            median_tests_cons_50 = float(stats_tests_cons_50['median']) if stats_tests_cons_50['median'] is not None else 0.0
+            median_tests_non_50 = float(stats_tests_non_50['median']) if stats_tests_non_50['median'] is not None else 0.0
 
             # Save Report TXT & calculate cohort details
             report_content = f"""=== BERICHT: DURCHGÄNGIG ERHÖHTE EOSINOPHILE ===
@@ -811,13 +860,13 @@ Anzahl Patienten mit mindestens 1 Eos-Messung: {total_pat_with_eos}
 
 --- SCHWELLE >= 90% ---
 Davon durchgängig erhöht (in >=90% der Messungen > {eos_threshold}): {cons_count_90} ({cons_pct_90:.2f}%)
-  Gruppe 'Durchgängig erhöht (>=90%)': {median_tests_cons_90} Messungen pro Patient (Mediane)
-  Gruppe 'Nicht durchgängig erhöht (<90%)': {median_tests_non_90} Messungen pro Patient (Mediane)
+  Gruppe 'Durchgängig erhöht (>=90%)': Median {median_tests_cons_90} (Mean {stats_tests_cons_90['mean']}, SD {stats_tests_cons_90['std']}, Q25 {stats_tests_cons_90['q25']}, Q75 {stats_tests_cons_90['q75']}) Messungen/Patient
+  Gruppe 'Nicht durchgängig erhöht (<90%)': Median {median_tests_non_90} (Mean {stats_tests_non_90['mean']}, SD {stats_tests_non_90['std']}, Q25 {stats_tests_non_90['q25']}, Q75 {stats_tests_non_90['q75']}) Messungen/Patient
 
 --- SCHWELLE >= 50% ---
 Davon durchgängig erhöht (in >=50% der Messungen > {eos_threshold}): {cons_count_50} ({cons_pct_50:.2f}%)
-  Gruppe 'Durchgängig erhöht (>=50%)': {median_tests_cons_50} Messungen pro Patient (Mediane)
-  Gruppe 'Nicht durchgängig erhöht (<50%)': {median_tests_non_50} Messungen pro Patient (Mediane)
+  Gruppe 'Durchgängig erhöht (>=50%)': Median {median_tests_cons_50} (Mean {stats_tests_cons_50['mean']}, SD {stats_tests_cons_50['std']}, Q25 {stats_tests_cons_50['q25']}, Q75 {stats_tests_cons_50['q75']}) Messungen/Patient
+  Gruppe 'Nicht durchgängig erhöht (<50%)': Median {median_tests_non_50} (Mean {stats_tests_non_50['mean']}, SD {stats_tests_non_50['std']}, Q25 {stats_tests_non_50['q25']}, Q75 {stats_tests_non_50['q75']}) Messungen/Patient
 
 === KOHORTEN-DETAILS ===
 
@@ -835,38 +884,58 @@ Davon durchgängig erhöht (in >=50% der Messungen > {eos_threshold}): {cons_cou
                 coh_pct_90 = (coh_cons_90 / coh_total * 100) if coh_total > 0 else 0.0
                 cons_coh_subset_90 = df_coh[df_coh['Consistently_Elevated_90'] == "Durchgängig erhöht (>=90%)"]
                 non_coh_subset_90 = df_coh[df_coh['Consistently_Elevated_90'] == "Nicht durchgängig erhöht (<90%)"]
-                median_tests_cons_coh_90 = float(cons_coh_subset_90['Total_Measurements'].median()) if not cons_coh_subset_90.empty else 0.0
-                median_tests_non_coh_90 = float(non_coh_subset_90['Total_Measurements'].median()) if not non_coh_subset_90.empty else 0.0
+                stats_cons_coh_90 = compute_descriptive_stats(cons_coh_subset_90['Total_Measurements'])
+                stats_non_coh_90 = compute_descriptive_stats(non_coh_subset_90['Total_Measurements'])
+                median_tests_cons_coh_90 = float(stats_cons_coh_90['median']) if stats_cons_coh_90['median'] is not None else 0.0
+                median_tests_non_coh_90 = float(stats_non_coh_90['median']) if stats_non_coh_90['median'] is not None else 0.0
 
                 # 50%
                 coh_cons_50 = int(sum(df_coh['Consistently_Elevated_50'] == "Durchgängig erhöht (>=50%)"))
                 coh_pct_50 = (coh_cons_50 / coh_total * 100) if coh_total > 0 else 0.0
                 cons_coh_subset_50 = df_coh[df_coh['Consistently_Elevated_50'] == "Durchgängig erhöht (>=50%)"]
                 non_coh_subset_50 = df_coh[df_coh['Consistently_Elevated_50'] == "Nicht durchgängig erhöht (<50%)"]
-                median_tests_cons_coh_50 = float(cons_coh_subset_50['Total_Measurements'].median()) if not cons_coh_subset_50.empty else 0.0
-                median_tests_non_coh_50 = float(non_coh_subset_50['Total_Measurements'].median()) if not non_coh_subset_50.empty else 0.0
+                stats_cons_coh_50 = compute_descriptive_stats(cons_coh_subset_50['Total_Measurements'])
+                stats_non_coh_50 = compute_descriptive_stats(non_coh_subset_50['Total_Measurements'])
+                median_tests_cons_coh_50 = float(stats_cons_coh_50['median']) if stats_cons_coh_50['median'] is not None else 0.0
+                median_tests_non_coh_50 = float(stats_non_coh_50['median']) if stats_non_coh_50['median'] is not None else 0.0
 
                 report_content += f"""Kohorte: {coh}
   Patienten mit Eos: {coh_total}
   [>=90% Schwelle] Davon durchgängig erhöht: {coh_cons_90} ({coh_pct_90:.2f}%)
-    Mediane Messungen (durchg. erhöht >=90%): {median_tests_cons_coh_90} | (nicht durchg.): {median_tests_non_coh_90}
+    Mediane Messungen (durchg. erhöht >=90%): {median_tests_cons_coh_90} (SD: {stats_cons_coh_90['std']}, Q25: {stats_cons_coh_90['q25']}, Q75: {stats_cons_coh_90['q75']}) | (nicht durchg.): {median_tests_non_coh_90} (SD: {stats_non_coh_90['std']}, Q25: {stats_non_coh_90['q25']}, Q75: {stats_non_coh_90['q75']})
   [>=50% Schwelle] Davon durchgängig erhöht: {coh_cons_50} ({coh_pct_50:.2f}%)
-    Mediane Messungen (durchg. erhöht >=50%): {median_tests_cons_coh_50} | (nicht durchg.): {median_tests_non_coh_50}
+    Mediane Messungen (durchg. erhöht >=50%): {median_tests_cons_coh_50} (SD: {stats_cons_coh_50['std']}, Q25: {stats_cons_coh_50['q25']}, Q75: {stats_cons_coh_50['q75']}) | (nicht durchg.): {median_tests_non_coh_50} (SD: {stats_non_coh_50['std']}, Q25: {stats_non_coh_50['q25']}, Q75: {stats_non_coh_50['q75']})
 
 """
                 cohort_details_90[coh] = {
                     "total_patients": coh_total,
                     "consistently_elevated_count": coh_cons_90,
                     "consistently_elevated_percent": round(coh_pct_90, 2),
+                    "mean_measurements_consistently_elevated": stats_cons_coh_90['mean'],
+                    "std_measurements_consistently_elevated": stats_cons_coh_90['std'],
                     "median_measurements_consistently_elevated": median_tests_cons_coh_90,
-                    "median_measurements_not_consistently_elevated": median_tests_non_coh_90
+                    "q25_measurements_consistently_elevated": stats_cons_coh_90['q25'],
+                    "q75_measurements_consistently_elevated": stats_cons_coh_90['q75'],
+                    "mean_measurements_not_consistently_elevated": stats_non_coh_90['mean'],
+                    "std_measurements_not_consistently_elevated": stats_non_coh_90['std'],
+                    "median_measurements_not_consistently_elevated": median_tests_non_coh_90,
+                    "q25_measurements_not_consistently_elevated": stats_non_coh_90['q25'],
+                    "q75_measurements_not_consistently_elevated": stats_non_coh_90['q75']
                 }
                 cohort_details_50[coh] = {
                     "total_patients": coh_total,
                     "consistently_elevated_count": coh_cons_50,
                     "consistently_elevated_percent": round(coh_pct_50, 2),
+                    "mean_measurements_consistently_elevated": stats_cons_coh_50['mean'],
+                    "std_measurements_consistently_elevated": stats_cons_coh_50['std'],
                     "median_measurements_consistently_elevated": median_tests_cons_coh_50,
-                    "median_measurements_not_consistently_elevated": median_tests_non_coh_50
+                    "q25_measurements_consistently_elevated": stats_cons_coh_50['q25'],
+                    "q75_measurements_consistently_elevated": stats_cons_coh_50['q75'],
+                    "mean_measurements_not_consistently_elevated": stats_non_coh_50['mean'],
+                    "std_measurements_not_consistently_elevated": stats_non_coh_50['std'],
+                    "median_measurements_not_consistently_elevated": median_tests_non_coh_50,
+                    "q25_measurements_not_consistently_elevated": stats_non_coh_50['q25'],
+                    "q75_measurements_not_consistently_elevated": stats_non_coh_50['q75']
                 }
 
             # Save JSON
@@ -877,15 +946,31 @@ Davon durchgängig erhöht (in >=50% der Messungen > {eos_threshold}): {cons_cou
                 "threshold_90pct": {
                     "consistently_elevated_count": cons_count_90,
                     "consistently_elevated_percent": round(cons_pct_90, 2),
+                    "mean_measurements_consistently_elevated": stats_tests_cons_90['mean'],
+                    "std_measurements_consistently_elevated": stats_tests_cons_90['std'],
                     "median_measurements_consistently_elevated": median_tests_cons_90,
+                    "q25_measurements_consistently_elevated": stats_tests_cons_90['q25'],
+                    "q75_measurements_consistently_elevated": stats_tests_cons_90['q75'],
+                    "mean_measurements_not_consistently_elevated": stats_tests_non_90['mean'],
+                    "std_measurements_not_consistently_elevated": stats_tests_non_90['std'],
                     "median_measurements_not_consistently_elevated": median_tests_non_90,
+                    "q25_measurements_not_consistently_elevated": stats_tests_non_90['q25'],
+                    "q75_measurements_not_consistently_elevated": stats_tests_non_90['q75'],
                     "cohort_details": cohort_details_90
                 },
                 "threshold_50pct": {
                     "consistently_elevated_count": cons_count_50,
                     "consistently_elevated_percent": round(cons_pct_50, 2),
+                    "mean_measurements_consistently_elevated": stats_tests_cons_50['mean'],
+                    "std_measurements_consistently_elevated": stats_tests_cons_50['std'],
                     "median_measurements_consistently_elevated": median_tests_cons_50,
+                    "q25_measurements_consistently_elevated": stats_tests_cons_50['q25'],
+                    "q75_measurements_consistently_elevated": stats_tests_cons_50['q75'],
+                    "mean_measurements_not_consistently_elevated": stats_tests_non_50['mean'],
+                    "std_measurements_not_consistently_elevated": stats_tests_non_50['std'],
                     "median_measurements_not_consistently_elevated": median_tests_non_50,
+                    "q25_measurements_not_consistently_elevated": stats_tests_non_50['q25'],
+                    "q75_measurements_not_consistently_elevated": stats_tests_non_50['q75'],
                     "cohort_details": cohort_details_50
                 },
                 "legacy_90pct_cohort_details": cohort_details_90
@@ -942,25 +1027,11 @@ Davon durchgängig erhöht (in >=50% der Messungen > {eos_threshold}): {cons_cou
 
         stats_3g_letzt = {}
         for g, sub in df_dedup_letzt[df_dedup_letzt['Three_Group_Category'] != 'Andere'].groupby('Three_Group_Category'):
-            vals = sub['max_eo'].dropna()
-            stats_3g_letzt[g] = {
-                "count": int(len(vals)),
-                "mean": round(float(vals.mean()), 4) if not vals.empty else None,
-                "median": round(float(vals.median()), 4) if not vals.empty else None,
-                "min": round(float(vals.min()), 4) if not vals.empty else None,
-                "max": round(float(vals.max()), 4) if not vals.empty else None
-            }
+            stats_3g_letzt[g] = compute_descriptive_stats(sub['max_eo'])
 
         stats_sub_letzt = {}
         for g, sub in df_dedup_letzt[~df_dedup_letzt['Subcategory'].isin(['COPD Sonstige', 'Andere'])].groupby('Subcategory'):
-            vals = sub['max_eo'].dropna()
-            stats_sub_letzt[g] = {
-                "count": int(len(vals)),
-                "mean": round(float(vals.mean()), 4) if not vals.empty else None,
-                "median": round(float(vals.median()), 4) if not vals.empty else None,
-                "min": round(float(vals.min()), 4) if not vals.empty else None,
-                "max": round(float(vals.max()), 4) if not vals.empty else None
-            }
+            stats_sub_letzt[g] = compute_descriptive_stats(sub['max_eo'])
 
         df_dedup_letzt['Eos_Category'] = df_dedup_letzt['max_eo'].apply(categorize_eos)
         df_sun_letzt = df_dedup_letzt[df_dedup_letzt['Subcategory'].isin(subcats)].copy()
