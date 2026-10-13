@@ -13,3 +13,6 @@ Output/
 
 # Misc
 doku.docx
+logs/
+*.tmp.jsonl
+.env

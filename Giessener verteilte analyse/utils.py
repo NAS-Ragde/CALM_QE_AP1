@@ -22,13 +22,34 @@ def setup_logging(log_filename, log_dir="logs"):
         ]
     )
 
+def load_dotenv_vars(path=None):
+    """Read KEY=VALUE pairs from a .env file (values may be quoted). Existing env vars win."""
+    env = {}
+    if path is None:
+        path = next((p for p in (".env", os.path.join("..", ".env")) if os.path.exists(p)), ".env")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+    env.update({k: v for k, v in os.environ.items() if k.startswith("SHIP_")})
+    return env
+
 def load_config(config_file="config.json"):
     if not os.path.exists(config_file):
         logging.error(f"Configuration file {config_file} not found. Please create it.")
         sys.exit(1)
-    
     with open(config_file, "r", encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    if config["fhir"].get("auth_type") == "ship":
+        env = load_dotenv_vars()
+        base = env.get("SHIP_BASE_URL", "").rstrip("/")
+        if base:
+            config["fhir"]["base_url"] = base if "/app/FHIR" in base else f"{base}/app/FHIR/r4"
+    return config
+
 
 def setup_auth(config):
     auth = None
@@ -49,6 +70,29 @@ def setup_auth(config):
             headers["Authorization"] = f"Bearer {token}"
         else:
             logging.error("Token auth selected but token is not configured properly.")
+            sys.exit(1)
+    elif auth_type == "ship":
+        env = load_dotenv_vars()
+        base = env.get("SHIP_BASE_URL", "").rstrip("/")
+        base = base.split("/app/FHIR")[0]
+        username = env.get("SHIP_USERNAME", "")
+        password = env.get("SHIP_PASSWORD", "")
+        if not base or not username or not password:
+            logging.error("SHIP auth selected but SHIP_BASE_URL/SHIP_USERNAME/SHIP_PASSWORD are missing (.env).")
+            sys.exit(1)
+        try:
+            session = requests.Session()
+            resp = session.post(f"{base}/app/Auth/login",
+                                data={"username": username, "password": password},
+                                allow_redirects=False, timeout=30)
+            token = session.cookies.get("shipToken")
+            if not token:
+                logging.error(f"SHIP login failed - no shipToken cookie received (HTTP {resp.status_code}).")
+                sys.exit(1)
+            headers["Cookie"] = f"shipToken={token}"
+            logging.info("Successfully authenticated with SHIP.")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to authenticate with SHIP: {e}")
             sys.exit(1)
     elif auth_type == "oauth2":
         oauth_cfg = config["fhir"].get("oauth2", {})
@@ -127,6 +171,50 @@ def save_csv(resources, filepath):
         writer.writerows(flat_rows)
 
     logging.info(f"Saved: {filepath} ({len(flat_rows)} rows, {len(all_cols)} columns)")
+
+class CsvStreamWriter:
+    """Streams flattened FHIR resources to disk and writes CSV without keeping all data in memory."""
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.tmp_filepath = filepath + ".tmp.jsonl"
+        self.columns = set()
+        self.count = 0
+        self._tmp_file = open(self.tmp_filepath, "w", encoding="utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def write_resource(self, resource):
+        flat = flatten_fhir(resource)
+        self.columns.update(flat.keys())
+        self._tmp_file.write(json.dumps(flat) + "\n")
+        self.count += 1
+
+    def close(self):
+        if self._tmp_file and not self._tmp_file.closed:
+            self._tmp_file.close()
+
+        if self.count == 0:
+            if os.path.exists(self.tmp_filepath):
+                os.remove(self.tmp_filepath)
+            logging.warning(f"No data for {self.filepath} – file will not be created.")
+            return
+
+        all_cols = sorted(self.columns)
+        with open(self.tmp_filepath, "r", encoding="utf-8") as in_f, \
+             open(self.filepath, "w", newline="", encoding="utf-8") as out_f:
+            writer = csv.DictWriter(out_f, fieldnames=all_cols, extrasaction="ignore")
+            writer.writeheader()
+            for line in in_f:
+                writer.writerow(json.loads(line))
+
+        if os.path.exists(self.tmp_filepath):
+            os.remove(self.tmp_filepath)
+
+        logging.info(f"Saved: {self.filepath} ({self.count} rows, {len(all_cols)} columns)")
 
 def safe_read_csv(filepath):
     """Safely read a CSV file using pandas."""

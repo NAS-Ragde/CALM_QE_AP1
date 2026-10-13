@@ -5,7 +5,9 @@ import sys
 import time
 import logging
 import json
-from utils import setup_logging, load_config, setup_auth, save_csv
+import gc
+from urllib.parse import quote
+from utils import setup_logging, load_config, setup_auth, save_csv, CsvStreamWriter
 
 # Setup Logging
 setup_logging("download.log")
@@ -71,10 +73,33 @@ RESOURCES = {
     "Medication":        None,
 }
 
-# =============================================================================
+
+def fetch_and_write_pages(url, writer):
+    """Follow FHIR pagination and stream resources directly to the writer."""
+    page = 1
+    while url:
+        logging.info(f"    Page {page}...")
+        try:
+            resp = requests.get(url, auth=AUTH, headers=HEADERS, timeout=60)
+            resp.raise_for_status()
+            bundle = resp.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error: {e}")
+            logging.info(f"Waiting 10 seconds and retrying page {page}...")
+            time.sleep(10)
+            continue
+
+        for entry in bundle.get("entry", []):
+            resource = entry.get("resource")
+            if resource:
+                writer.write_resource(resource)
+
+        url = next((link.get("url") for link in bundle.get("link", []) if link.get("relation") == "next"), None)
+        if url:
+            page += 1
 
 def fetch_all_pages(url):
-    """Follow FHIR pagination and collect all resources."""
+    """Follow FHIR pagination and collect all resources in memory."""
     resources = []
     page = 1
     while url:
@@ -90,10 +115,13 @@ def fetch_all_pages(url):
             continue
 
         for entry in bundle.get("entry", []):
-            resources.append(entry.get("resource", {}))
+            resource = entry.get("resource")
+            if resource:
+                resources.append(resource)
 
         url = next((link.get("url") for link in bundle.get("link", []) if link.get("relation") == "next"), None)
-        if url: page += 1
+        if url:
+            page += 1
 
     return resources
 
@@ -116,14 +144,15 @@ def extract_patient_ids_from_conditions():
     logging.info(f"Extracted {len(patient_ids)} unique cohort patient IDs from condition.csv")
     return patient_ids
 
-def fetch_resources(resource_type, code_list=None, patient_ids=None):
-    """Fetch resources, batching by code list and/or patient IDs to keep queries targeted and fast."""
-    
+def fetch_resources(resource_type, filepath=None, code_list=None, patient_ids=None):
+    """Fetch resources, batching by code list and/or patient IDs."""
+    writer = CsvStreamWriter(filepath) if filepath else None
+    in_memory = [] if writer is None else None
+
     # If patient_ids are provided, filter queries by cohort patients
     if patient_ids:
         PATIENT_BATCH_SIZE = 50
         patient_chunks = [patient_ids[i:i + PATIENT_BATCH_SIZE] for i in range(0, len(patient_ids), PATIENT_BATCH_SIZE)]
-        all_resources = []
 
         logging.info(f"Fetching {resource_type} for {len(patient_ids)} cohort patient(s) in {len(patient_chunks)} patient batch(es)...")
 
@@ -131,30 +160,43 @@ def fetch_resources(resource_type, code_list=None, patient_ids=None):
             patient_str = ",".join(p_chunk)
 
             if code_list:
-                # Batch codes if more than 50
                 CODE_BATCH_SIZE = 50
                 code_chunks = [code_list[i:i + CODE_BATCH_SIZE] for i in range(0, len(code_list), CODE_BATCH_SIZE)]
                 for c_idx, c_chunk in enumerate(code_chunks, 1):
                     code_str = ",".join(c_chunk)
                     url = f"{FHIR_BASE_URL}/{resource_type}?patient={patient_str}&code={code_str}&_count=200"
                     logging.info(f"  Patient Batch {p_idx}/{len(patient_chunks)} | Code Batch {c_idx}/{len(code_chunks)} ...")
-                    all_resources.extend(fetch_all_pages(url))
+                    if writer:
+                        fetch_and_write_pages(url, writer)
+                    else:
+                        in_memory.extend(fetch_all_pages(url))
             else:
                 url = f"{FHIR_BASE_URL}/{resource_type}?patient={patient_str}&_count=200"
                 logging.info(f"  Patient Batch {p_idx}/{len(patient_chunks)} ...")
-                all_resources.extend(fetch_all_pages(url))
+                if writer:
+                    fetch_and_write_pages(url, writer)
+                else:
+                    in_memory.extend(fetch_all_pages(url))
 
-        logging.info(f"Loaded {len(all_resources)} {resource_type} entries total for cohort patients")
-        return all_resources
+            gc.collect()
+
+        if writer:
+            writer.close()
+            return []
+        logging.info(f"Loaded {len(in_memory)} {resource_type} entries total for cohort patients")
+        return in_memory
 
     # Fallback if no patient_ids provided
     if not code_list:
         url = f"{FHIR_BASE_URL}/{resource_type}?_count=200"
         logging.info(f"Fetching {resource_type} (no code/patient filter) ...")
+        if writer:
+            fetch_and_write_pages(url, writer)
+            writer.close()
+            return []
         return fetch_all_pages(url)
 
     BATCH_SIZE = 50
-    all_resources = []
     chunks = [code_list[i:i + BATCH_SIZE] for i in range(0, len(code_list), BATCH_SIZE)]
 
     logging.info(f"Fetching {resource_type} in {len(chunks)} batch(es) of max {BATCH_SIZE} codes...")
@@ -162,13 +204,19 @@ def fetch_resources(resource_type, code_list=None, patient_ids=None):
         code_str = ",".join(chunk)
         url = f"{FHIR_BASE_URL}/{resource_type}?code={code_str}&_count=200"
         logging.info(f"  Batch {idx}/{len(chunks)} ...")
-        all_resources.extend(fetch_all_pages(url))
+        if writer:
+            fetch_and_write_pages(url, writer)
+        else:
+            in_memory.extend(fetch_all_pages(url))
 
-    logging.info(f"Loaded {len(all_resources)} {resource_type} entries total")
-    return all_resources
+    if writer:
+        writer.close()
+        return []
+    logging.info(f"Loaded {len(in_memory)} {resource_type} entries total")
+    return in_memory
 
 def fetch_encounters_from_condition_csv():
-    """Extract Encounter IDs from condition.csv and download them in batches."""
+    """Extract Encounter IDs or Identifiers from condition.csv and stream them to CSV."""
     encounter_csv = os.path.join(OUTPUT_DIR, "encounter.csv")
     condition_csv = os.path.join(OUTPUT_DIR, "condition.csv")
 
@@ -180,32 +228,44 @@ def fetch_encounters_from_condition_csv():
         logging.warning("condition.csv not found – Encounter download skipped.")
         return
 
-    logging.info("Loading Encounters (via IDs from condition.csv)...")
+    logging.info("Loading Encounters (via condition.csv)...")
 
     encounter_ids = set()
+    encounter_identifiers = set()
     with open(condition_csv, encoding="utf-8") as f:
         for row in csv.DictReader(f):
             ref = row.get("(1) encounter.reference", "")
             if ref and ref.startswith("Encounter/"):
                 encounter_ids.add(ref.replace("Encounter/", "").strip())
+            identifier = row.get("(1) encounter.identifier.value", "")
+            if identifier:
+                encounter_identifiers.add(identifier.strip())
 
     encounter_ids = list(encounter_ids)
-    logging.info(f"Found {len(encounter_ids)} unique Encounter IDs in condition.csv")
+    encounter_identifiers = list(encounter_identifiers)
 
-    if not encounter_ids: return
-
-    BATCH_SIZE = 100
-    all_encounters = []
-    batches = [encounter_ids[i:i + BATCH_SIZE] for i in range(0, len(encounter_ids), BATCH_SIZE)]
-
-    logging.info(f"Downloading {len(batches)} batch(es) of max {BATCH_SIZE} encounters...")
-    for idx, batch in enumerate(batches, 1):
-        url = f"{FHIR_BASE_URL}/Encounter?_id={','.join(batch)}&_count={BATCH_SIZE}"
-        logging.info(f"Batch {idx}/{len(batches)}...")
-        all_encounters.extend(fetch_all_pages(url))
-
-    logging.info(f"Total of {len(all_encounters)} Encounter entries loaded")
-    save_csv(all_encounters, os.path.join(OUTPUT_DIR, "encounter.csv"))
+    if encounter_ids:
+        logging.info(f"Downloading encounters via {len(encounter_ids)} Encounter IDs in batches...")
+        BATCH_SIZE = 100
+        batches = [encounter_ids[i:i + BATCH_SIZE] for i in range(0, len(encounter_ids), BATCH_SIZE)]
+        with CsvStreamWriter(encounter_csv) as writer:
+            for idx, batch in enumerate(batches, 1):
+                url = f"{FHIR_BASE_URL}/Encounter?_id={','.join(batch)}&_count={BATCH_SIZE}"
+                logging.info(f"Batch {idx}/{len(batches)}...")
+                fetch_and_write_pages(url, writer)
+    elif encounter_identifiers:
+        logging.info(f"Encounter IDs not found. Fallback: Downloading via {len(encounter_identifiers)} Encounter Identifiers...")
+        BATCH_SIZE = 100
+        with CsvStreamWriter(encounter_csv) as writer:
+            for idx, identifier in enumerate(encounter_identifiers, 1):
+                encoded = quote(identifier, safe="")
+                url = f"{FHIR_BASE_URL}/Encounter?identifier={encoded}&_count={BATCH_SIZE}"
+                if idx % 50 == 0 or idx == len(encounter_identifiers):
+                    logging.info(f"Identifier {idx}/{len(encounter_identifiers)}...")
+                fetch_and_write_pages(url, writer)
+    else:
+        logging.warning("No Encounter references or identifiers found in condition.csv.")
+        return
 
 def main():
     logging.info("=" * 60)
@@ -218,7 +278,7 @@ def main():
     condition_csv = os.path.join(OUTPUT_DIR, "condition.csv")
     if not os.path.exists(condition_csv):
         logging.info("Loading Condition (establishing cohort)...")
-        save_csv(fetch_resources("Condition", code_list=condition_codes), condition_csv)
+        fetch_resources("Condition", filepath=condition_csv, code_list=condition_codes)
     else:
         logging.info("Skipping Condition (File already exists: condition.csv)")
 
@@ -239,9 +299,9 @@ def main():
         
         # Filter Observation and MedicationRequest by cohort patient_ids
         if resource_type in ["Observation", "MedicationRequest"] and patient_ids:
-            save_csv(fetch_resources(resource_type, code_list=codes, patient_ids=patient_ids), filepath)
+            fetch_resources(resource_type, filepath=filepath, code_list=codes, patient_ids=patient_ids)
         else:
-            save_csv(fetch_resources(resource_type, code_list=codes), filepath)
+            fetch_resources(resource_type, filepath=filepath, code_list=codes)
 
     # 3. Download Encounters
     fetch_encounters_from_condition_csv()

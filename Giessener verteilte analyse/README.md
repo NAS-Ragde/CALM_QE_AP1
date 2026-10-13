@@ -23,7 +23,7 @@ A fully containerized Python pipeline for standardized, multi-site analysis of i
 
 Before running the pipeline, fill in `config.json` with your site's FHIR server credentials.
 
-**Supported authentication types:** `basic`, `token`, `oauth2`
+**Supported authentication types:** `basic`, `token`, `oauth2`, `ship`
 
 ```json
 {
@@ -51,6 +51,18 @@ Before running the pipeline, fill in `config.json` with your site's FHIR server 
   }
 }
 ```
+
+### SHIP Authentication (UK Essen)
+
+The SHIP FHIR gateway uses a cookie-based login instead of Basic/OAuth2. Set `"auth_type": "ship"` in `config.json` and put the credentials in a `.env` file next to the scripts (or in the repository root; `.env` is git-ignored):
+
+```text
+SHIP_BASE_URL=https://ship.example.de     # FHIR endpoint /app/FHIR/r4 is appended automatically
+SHIP_USERNAME=...
+SHIP_PASSWORD=...
+```
+
+The scripts log in via `/app/Auth/login`, send the returned `shipToken` cookie with every request and re-authenticate automatically when the session expires. `base_url` in `config.json` is ignored in this mode.
 
 ---
 
@@ -220,8 +232,8 @@ All results are saved under the `results/` directory:
 | `unit_eos`                        | Automatically detected Eosinophil unit (e.g.`10*9/L`)                          |
 | `kruskal_p_3groups`               | Kruskal-Wallis p-value across the 3 main groups                                  |
 | `kruskal_p_subcategories`         | Kruskal-Wallis p-value across all subcategories                                  |
-| `descriptive_stats_3groups`       | Median, mean, min, max, Q25, Q75, n per main group                               |
-| `descriptive_stats_subcategories` | Same statistics per COPD subcategory                                             |
+| `descriptive_stats_3groups`       | Count, mean, std (standard deviation), median, Q25, Q75, min, max per main group |
+| `descriptive_stats_subcategories` | Same descriptive statistics per COPD subcategory                                |
 | `sunburst_distribution`           | Case counts and percentages (No measurement / Normal / Elevated) per subcategory |
 
 ### `fhir_eos_bestimmungsrate_tabelle.json`
@@ -241,22 +253,24 @@ All results are saved under the `results/` directory:
 | ------------------------------------------------- | -------------------------------------------------------------- |
 | `unit_eos`                                      | Automatically detected measurement unit                        |
 | `total_patients_with_eos`                       | Patients with at least 1 Eosinophil measurement                |
-| `consistently_elevated_count`                   | Patients with ≥90% of measurements above the threshold        |
+| `consistently_elevated_count`                   | Patients with ≥90% (or ≥50%) of measurements above threshold   |
 | `consistently_elevated_percent`                 | Percentage of persistently elevated patients                   |
-| `median_measurements_consistently_elevated`     | Median number of measurements per patient (elevated group)     |
-| `median_measurements_not_consistently_elevated` | Median number of measurements per patient (non-elevated group) |
-| `threshold_used`                                | Threshold value used (default:`0.3`)                         |
+| `mean` / `std` / `median` / `q25` / `q75`       | Number of measurements per patient (elevated & non-elevated)   |
+| `threshold_used`                                | Threshold value used (default: `0.3`)                          |
+| `cohort_details`                                | Detailed breakdown for COPD-only, Asthma-only, and Overlap     |
 
 ### `correlation_eos_exacerbations.json`
 
-| Field                      | Description                                                      |
-| -------------------------- | ---------------------------------------------------------------- |
-| `n_patients`             | Patients with both Eosinophil measurements and exacerbation data |
-| `pearson_r`              | Pearson correlation coefficient                                  |
-| `p_value`                | Statistical significance                                         |
-| `mean_eos_all`           | Mean Eosinophil value                                            |
-| `unit_eos`               | Measurement unit                                                 |
-| `mean_exacerbations_all` | Mean number of exacerbations                                     |
+| Field                                                | Description                                                      |
+| ---------------------------------------------------- | ---------------------------------------------------------------- |
+| `n_patients`                                       | Patients with both Eosinophil measurements and exacerbation data |
+| `pearson_r`                                        | Pearson correlation coefficient                                  |
+| `p_value`                                          | Statistical significance                                         |
+| `mean_eos_all` / `std_eos_all`                     | Mean and standard deviation of Eosinophils                       |
+| `median_eos_all` / `q25_eos_all` / `q75_eos_all`   | Median, Q25, and Q75 of Eosinophils                              |
+| `unit_eos`                                         | Measurement unit                                                 |
+| `mean_exacerbations_all` / `std_exacerbations_all` | Mean and standard deviation of exacerbations                     |
+| `median` / `q25` / `q75` _exacerbations_all        | Median, Q25, and Q75 of exacerbations                            |
 
 ### `ige_summary.json`
 
@@ -265,7 +279,8 @@ All results are saved under the `results/` directory:
 | `diagnosis`                 | `"Asthma"` or `"COPD"`               |
 | `n_measurements`            | Total number of IgE measurements         |
 | `n_patients`                | Patients with at least 1 IgE measurement |
-| `median_ige` / `mean_ige` | Median / mean IgE value                  |
-| `q25` / `q75`             | 25th / 75th percentile                   |
+| `mean_ige` / `std_ige`      | Mean and standard deviation of IgE       |
+| `median_ige`                | Median IgE value                         |
+| `q25` / `q75`             | 25th / 75th percentile (interquartile range) |
 | `min_ige` / `max_ige`     | Minimum / maximum IgE value              |
 | `unit_ige`                  | Automatically detected IgE unit          |
